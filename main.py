@@ -14,6 +14,10 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import stat
+import ipaddress
+import socket
+import urllib.parse
 
 UTC = dt.timezone.utc
 PEM = re.compile(rb'-----BEGIN CERTIFICATE-----\s*(.*?)\s*-----END CERTIFICATE-----', re.S)
@@ -1162,6 +1166,15 @@ def render_enhanced(report, args):
         ("certificates", render_certificate_details),
         ("errors", render_error_log),
         ("interpretation", render_interpretation),
+        ("advanced", render_advanced_audit),
+        ("comparison", render_comparison),
+        ("policy", render_policy_inventory),
+        ("verification", render_verification_inventory),
+        ("issuergraph", render_issuer_graph),
+        ("integrity", render_integrity),
+        ("keyfamilies", render_key_families),
+        ("validitywindows", render_validity_windows),
+        ("calendar", render_expiration_calendar),
     ]
     render_header(canvas, report, args)
     enabled = set(args.sections.split(",")) if args.sections != "all" else None
@@ -1272,6 +1285,21 @@ def enhanced_parser():
     parser.add_argument("--openssl", choices=["off", "summary", "full"], default="summary")
     parser.add_argument("--format", choices=["text", "json", "jsonl", "csv"], default="text")
     parser.add_argument("--output")
+    parser.add_argument("--baseline", help="Compare against a previous JSON report")
+    parser.add_argument("--write-baseline", help="Write current inventory as a JSON baseline")
+    parser.add_argument("--strict", action="store_true", help="Return nonzero for selected findings")
+    parser.add_argument("--strict-expiring", action="store_true")
+    parser.add_argument("--strict-crypto", action="store_true")
+    parser.add_argument("--min-rsa-bits", type=int, default=2048)
+    parser.add_argument("--fingerprint", action="append", default=[])
+    parser.add_argument("--subject-regex")
+    parser.add_argument("--issuer-regex")
+    parser.add_argument("--only-findings", action="store_true")
+    parser.add_argument("--inspect-files", action="store_true")
+    parser.add_argument("--inspect-policy", action="store_true")
+    parser.add_argument("--verify-with", help="Explicit CA bundle for offline OpenSSL chain verification")
+    parser.add_argument("--verify-timeout", type=float, default=5.0)
+    parser.add_argument("--fail-on-change", action="store_true")
     return add_enhanced_arguments(parser)
 
 
@@ -1283,10 +1311,23 @@ def validate_enhanced_arguments(parser, args):
         parser.error("--width must be between 64 and 300")
     if args.warn_days < 0:
         parser.error("--warn-days must not be negative")
+    if args.min_rsa_bits < 1024 or args.min_rsa_bits > 16384:
+        parser.error("--min-rsa-bits must be between 1024 and 16384")
+    if args.verify_timeout <= 0 or args.verify_timeout > 120:
+        parser.error("--verify-timeout must be between 0 and 120 seconds")
+    for key in ("subject_regex", "issuer_regex"):
+        value = getattr(args, key)
+        if value:
+            try:
+                re.compile(value)
+            except re.error as error:
+                parser.error(f"Invalid {key}: {error}")
     allowed = {
         "dashboard", "status", "expiration", "timeline", "signatures",
         "keys", "issuers", "subjects", "files", "findings", "duplicates",
         "crypto", "certificates", "errors", "interpretation",
+        "advanced", "comparison", "policy", "verification",
+        "issuergraph", "integrity", "keyfamilies", "validitywindows", "calendar",
     }
     if args.sections != "all":
         chosen = {part.strip() for part in args.sections.split(",")}
@@ -1302,6 +1343,570 @@ def resolve_default_paths():
         if candidate.is_file():
             return [raw]
     return []
+
+
+
+def normalize_fingerprint(value):
+    return re.sub(r"[^0-9a-f]", "", str(value).lower())
+
+
+def validate_fingerprint(value):
+    normalized = normalize_fingerprint(value)
+    if len(normalized) not in (40, 64):
+        raise ValueError("fingerprint must be SHA-1 (40 hex) or SHA-256 (64 hex)")
+    return normalized
+
+
+def file_metadata(path):
+    result = {"path": str(path), "exists": False}
+    try:
+        info = path.lstat()
+        result["exists"] = True
+        result["mode"] = stat.filemode(info.st_mode)
+        result["mode_octal"] = oct(stat.S_IMODE(info.st_mode))
+        result["uid"] = info.st_uid
+        result["gid"] = info.st_gid
+        result["inode"] = info.st_ino
+        result["device"] = info.st_dev
+        result["mtime_utc"] = dt.datetime.fromtimestamp(info.st_mtime, UTC).isoformat()
+        result["size"] = info.st_size
+        result["is_symlink"] = stat.S_ISLNK(info.st_mode)
+        result["world_writable"] = bool(info.st_mode & stat.S_IWOTH)
+        result["group_writable"] = bool(info.st_mode & stat.S_IWGRP)
+        if result["is_symlink"]:
+            result["symlink_target"] = os.readlink(path)
+            result["resolved"] = str(path.resolve(strict=False))
+            try:
+                target = path.stat()
+                result["target_mode"] = stat.filemode(target.st_mode)
+                result["target_world_writable"] = bool(target.st_mode & stat.S_IWOTH)
+            except OSError as error:
+                result["target_error"] = str(error)
+        else:
+            result["target_world_writable"] = result["world_writable"]
+    except OSError as error:
+        result["error"] = str(error)
+    return result
+
+
+def inspect_sources(report):
+    return [file_metadata(pathlib.Path(item["path"])) for item in report["files"]]
+
+
+def classify_key(record, minimum_rsa_bits):
+    details = record.get("openssl") or {}
+    name = (details.get("public_key_algorithm") or "").lower()
+    raw = details.get("public_key_bits")
+    try:
+        bits = int(raw)
+    except (ValueError, TypeError):
+        bits = None
+    findings = []
+    if "rsa" in name and bits is not None and bits < minimum_rsa_bits:
+        findings.append({"rule": "rsa_key_length", "severity": "high", "detail": f"RSA {bits} bits below {minimum_rsa_bits}"})
+    if ("ec" in name or "elliptic" in name) and bits is not None and bits < 224:
+        findings.append({"rule": "ec_key_length", "severity": "high", "detail": f"EC key length {bits} bits"})
+    if bits is None:
+        findings.append({"rule": "unknown_key_size", "severity": "info", "detail": "Public key size not extracted"})
+    return findings
+
+
+def classify_signature(record):
+    signature = ((record.get("openssl") or {}).get("signature_algorithm") or "").lower()
+    if not signature:
+        return [{"rule": "unknown_signature", "severity": "info", "detail": "Signature algorithm unavailable"}]
+    if "md5" in signature or "md2" in signature:
+        return [{"rule": "obsolete_signature", "severity": "high", "detail": signature}]
+    if "sha1" in signature or "sha-1" in signature:
+        return [{"rule": "legacy_signature", "severity": "medium", "detail": signature}]
+    return []
+
+
+def classify_validity(record, now, warn_days):
+    findings = []
+    before = parse_iso(record.get("not_before"))
+    after = parse_iso(record.get("not_after"))
+    if before is None or after is None:
+        findings.append({"rule": "missing_validity", "severity": "medium", "detail": "Incomplete validity metadata"})
+    if before is not None and after is not None and before > after:
+        findings.append({"rule": "reversed_validity", "severity": "high", "detail": "NotBefore exceeds NotAfter"})
+    if before is not None and before > now:
+        findings.append({"rule": "not_yet_valid", "severity": "medium", "detail": before.isoformat()})
+    if after is not None:
+        remaining = (after - now).total_seconds() / 86400
+        if remaining < 0:
+            findings.append({"rule": "expired", "severity": "high", "detail": f"Expired {abs(remaining):.2f} days ago"})
+        elif remaining <= warn_days:
+            findings.append({"rule": "expiring", "severity": "medium", "detail": f"Expires in {remaining:.2f} days"})
+    return findings
+
+
+def classify_certificate(record, args, now):
+    findings = classify_validity(record, now, args.warn_days)
+    findings.extend(classify_signature(record))
+    findings.extend(classify_key(record, args.min_rsa_bits))
+    if record.get("decode_error"):
+        findings.append({"rule": "decode_error", "severity": "high", "detail": record["decode_error"]})
+    if "not_marked_as_ca" in record.get("flags", []):
+        findings.append({"rule": "non_ca_certificate", "severity": "low", "detail": "Basic Constraints does not mark CA:TRUE"})
+    if record.get("self_issued"):
+        findings.append({"rule": "self_issued", "severity": "info", "detail": "Subject and issuer DNs match; signature not verified"})
+    return findings
+
+
+def inventory_map(report):
+    mapping = {}
+    for record in report.get("certificates", []):
+        digest = record.get("sha256")
+        if digest:
+            mapping.setdefault(digest, record)
+    return mapping
+
+
+def compare_inventories(current, previous):
+    current_map = inventory_map(current)
+    previous_map = inventory_map(previous)
+    added = sorted(current_map.keys() - previous_map.keys())
+    removed = sorted(previous_map.keys() - current_map.keys())
+    common = sorted(current_map.keys() & previous_map.keys())
+    changed_metadata = []
+    for digest in common:
+        old = previous_map[digest]
+        new = current_map[digest]
+        fields = ("subject", "issuer", "serial_number", "not_before", "not_after")
+        differences = {field: {"before": old.get(field), "after": new.get(field)}
+                       for field in fields if old.get(field) != new.get(field)}
+        if differences:
+            changed_metadata.append({"sha256": digest, "differences": differences})
+    return {
+        "changed": bool(added or removed or changed_metadata),
+        "previous_unique": len(previous_map),
+        "current_unique": len(current_map),
+        "unchanged": len(common) - len(changed_metadata),
+        "added": [{"sha256": digest, "subject": current_map[digest].get("subject"),
+                   "issuer": current_map[digest].get("issuer")} for digest in added],
+        "removed": [{"sha256": digest, "subject": previous_map[digest].get("subject"),
+                     "issuer": previous_map[digest].get("issuer")} for digest in removed],
+        "metadata_changes": changed_metadata,
+    }
+
+
+def load_baseline(path):
+    location = pathlib.Path(path)
+    if location.stat().st_size > 256 * 1024 * 1024:
+        raise ValueError("baseline exceeds 256 MiB")
+    with location.open("r", encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict) or not isinstance(value.get("certificates"), list):
+        raise ValueError("baseline must be a JSON report containing certificates")
+    for item in value["certificates"]:
+        if not isinstance(item, dict):
+            raise ValueError("baseline certificate entries must be objects")
+    return value
+
+
+def run_command(argv, timeout=10, input_data=None):
+    try:
+        completed = subprocess.run(argv, input=input_data, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, timeout=timeout, check=False)
+        return {"command": argv, "exit_code": completed.returncode,
+                "stdout": completed.stdout.decode("utf-8", "replace")[:2_000_000],
+                "stderr": completed.stderr.decode("utf-8", "replace")[:200_000]}
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {"command": argv, "error": str(error)}
+
+
+def inspect_system_policy():
+    result = {"platform": sys.platform, "tools": {}, "paths": []}
+    for name in ("trust", "update-ca-trust", "openssl"):
+        from shutil import which
+        result["tools"][name] = which(name)
+    for path in (
+        "/etc/pki/ca-trust", "/etc/pki/ca-trust/source/anchors",
+        "/etc/pki/ca-trust/source/blacklist", "/etc/pki/tls/certs",
+        "/etc/ssl/certs", "/usr/share/pki/ca-trust-source",
+    ):
+        result["paths"].append(file_metadata(pathlib.Path(path)))
+    if result["tools"].get("trust"):
+        result["trust_anchor_listing"] = run_command(
+            ["trust", "list", "--filter=ca-anchors"], timeout=20)
+        result["trust_blocklist_listing"] = run_command(
+            ["trust", "list", "--filter=blocklist"], timeout=20)
+    return result
+
+
+def extract_pem_by_digest(path, digest, max_bytes=64 * 1024 * 1024):
+    source = pathlib.Path(path)
+    if source.stat().st_size > max_bytes:
+        return None
+    raw = source.read_bytes()
+    for body in PEM.findall(raw):
+        try:
+            der = base64.b64decode(re.sub(rb"\s+", b"", body), validate=True)
+        except (ValueError, TypeError):
+            continue
+        if hashlib.sha256(der).hexdigest() == digest:
+            return b"-----BEGIN CERTIFICATE-----\n" + body + b"\n-----END CERTIFICATE-----\n"
+    return None
+
+
+def verify_inventory(report, args):
+    result = {"bundle": args.verify_with, "results": [], "verified": 0,
+              "failed": 0, "unavailable": 0}
+    bundle = pathlib.Path(args.verify_with)
+    if not bundle.is_file():
+        raise ValueError("--verify-with requires an existing CA bundle file")
+    if bundle.stat().st_size > args.max_bytes:
+        raise ValueError("verification CA bundle exceeds --max-bytes")
+    for record in unique_certificates(report):
+        item = {"sha256": record["sha256"], "subject": record.get("subject"),
+                "source": record["path"]}
+        try:
+            pem = extract_pem_by_digest(record["path"], record["sha256"], args.max_bytes)
+            if pem is None:
+                item["status"] = "unavailable"
+                item["detail"] = "Certificate bytes could not be recovered"
+            else:
+                with tempfile.NamedTemporaryFile(suffix=".pem") as stream:
+                    stream.write(pem)
+                    stream.flush()
+                    command = run_command(["openssl", "verify", "-CAfile", str(bundle),
+                                           stream.name], timeout=args.verify_timeout)
+                item["status"] = "verified" if command.get("exit_code") == 0 else "failed"
+                item["detail"] = (command.get("stdout") or command.get("stderr") or
+                                  command.get("error") or "")[:1000].strip()
+        except (OSError, ValueError) as error:
+            item["status"] = "unavailable"
+            item["detail"] = str(error)
+        result["results"].append(item)
+        result[item["status"]] += 1
+    result["caveat"] = "Offline OpenSSL verification against explicitly selected CAfile; no revocation or vendor policy validation"
+    return result
+
+
+def filter_report(report, args):
+    records = report["certificates"]
+    if args.fingerprint:
+        selected = {validate_fingerprint(value) for value in args.fingerprint}
+        records = [item for item in records if item["sha256"] in selected or item["sha1"] in selected]
+    if args.subject_regex:
+        expression = re.compile(args.subject_regex)
+        records = [item for item in records if expression.search(item.get("subject") or "")]
+    if args.issuer_regex:
+        expression = re.compile(args.issuer_regex)
+        records = [item for item in records if expression.search(item.get("issuer") or "")]
+    if args.only_findings:
+        records = [item for item in records if item.get("audit_findings") and
+                   any(f["severity"] != "info" for f in item["audit_findings"])]
+    return records
+
+
+def enrich_report(report, args):
+    now = dt.datetime.now(UTC)
+    unique = inventory_map(report)
+    critical = 0
+    crypto = 0
+    severity_counts = collections.Counter()
+    rule_counts = collections.Counter()
+    for digest, record in unique.items():
+        findings = classify_certificate(record, args, now)
+        for finding in findings:
+            severity_counts[finding["severity"]] += 1
+            rule_counts[finding["rule"]] += 1
+            if finding["severity"] == "high":
+                critical += 1
+            if finding["rule"] in ("rsa_key_length", "ec_key_length", "obsolete_signature", "legacy_signature"):
+                crypto += 1
+    for record in report["certificates"]:
+        record["audit_findings"] = classify_certificate(record, args, now)
+    report["audit"] = {
+        "evaluated_unique": len(unique), "critical_count": critical,
+        "crypto_count": crypto, "severity_counts": dict(severity_counts),
+        "rule_counts": dict(rule_counts),
+        "scope": "Heuristic local metadata review, not proof of trust or compromise",
+    }
+    report["issuer_graph"] = build_issuer_graph(report)
+    report["bundle_integrity"] = inspect_bundle_integrity(report)
+    report["key_families"] = summarize_key_families(report)
+    report["validity_windows"] = summarize_validity_windows(report)
+    report["expiration_calendar"] = certificate_expiration_calendar(report)
+    if args.inspect_files:
+        report["file_metadata"] = inspect_sources(report)
+        report["audit"]["writable_sources"] = sum(
+            item.get("world_writable", False) or item.get("target_world_writable", False)
+            for item in report["file_metadata"])
+    if args.inspect_policy:
+        report["system_policy"] = inspect_system_policy()
+    if args.verify_with:
+        report["verification"] = verify_inventory(report, args)
+    if args.baseline:
+        report["comparison"] = compare_inventories(report, load_baseline(args.baseline))
+    if args.fingerprint or args.subject_regex or args.issuer_regex or args.only_findings:
+        selected = filter_report(report, args)
+        report["selection"] = {"selected": len(selected), "original": len(report["certificates"])}
+        report["certificates"] = selected
+
+
+def render_advanced_audit(canvas, report, args):
+    canvas.section("16 / Advanced metadata assessment")
+    audit = report.get("audit", {})
+    if not audit:
+        canvas.notice("info", "No advanced audit information")
+        return
+    canvas.pair("Unique certificates assessed", audit.get("evaluated_unique"))
+    canvas.pair("High-severity observations", audit.get("critical_count"))
+    canvas.pair("Cryptographic observations", audit.get("crypto_count"))
+    canvas.subsection("Finding severity distribution")
+    canvas.table(["Severity", "Observations"],
+                 sorted(audit.get("severity_counts", {}).items()), widths=[25, 18])
+    canvas.subsection("Finding rule distribution")
+    canvas.table(["Rule", "Observations"],
+                 sorted(audit.get("rule_counts", {}).items(), key=lambda x: (-x[1], x[0])),
+                 widths=[45, 18])
+    if "writable_sources" in audit:
+        canvas.pair("World-writable sources", audit["writable_sources"])
+    canvas.wrap(audit.get("scope", ""))
+
+
+def render_comparison(canvas, report, args):
+    canvas.section("17 / Baseline drift analysis")
+    comparison = report.get("comparison")
+    if not comparison:
+        canvas.notice("info", "Provide --baseline to compare against a previous JSON inventory")
+        return
+    canvas.pair("Inventory changed", comparison["changed"])
+    canvas.pair("Previously unique", comparison["previous_unique"])
+    canvas.pair("Currently unique", comparison["current_unique"])
+    canvas.pair("Unchanged", comparison["unchanged"])
+    for title, key in (("New certificates", "added"), ("Removed certificates", "removed"),
+                       ("Metadata differences", "metadata_changes")):
+        entries = comparison[key]
+        canvas.subsection(f"{title}: {len(entries)}")
+        for item in entries[:args.top]:
+            canvas.pair(item["sha256"][:20], shorten(item.get("subject") or item.get("differences"), 85))
+        if len(entries) > args.top:
+            canvas.write(f"Additional entries omitted: {len(entries) - args.top}")
+
+
+def render_policy_inventory(canvas, report, args):
+    canvas.section("18 / Local trust policy inventory")
+    policy = report.get("system_policy")
+    if not policy:
+        canvas.notice("info", "Enable --inspect-policy to inspect local trust policy sources")
+        return
+    for tool, location in policy.get("tools", {}).items():
+        canvas.pair(tool, location or "not installed")
+    for entry in policy.get("paths", []):
+        canvas.pair(entry["path"], "present" if entry.get("exists") else "missing")
+    for key in ("trust_anchor_listing", "trust_blocklist_listing"):
+        listing = policy.get(key)
+        if listing:
+            canvas.pair(key, f"exit={listing.get('exit_code', 'error')}; "
+                        f"{len(listing.get('stdout', ''))} output characters")
+    canvas.wrap("Trust listings are raw local policy observations; this report does not establish TLS application-specific trust decisions")
+
+
+def render_verification_inventory(canvas, report, args):
+    canvas.section("19 / Explicit offline chain verification")
+    verification = report.get("verification")
+    if not verification:
+        canvas.notice("info", "Enable --verify-with PATH to perform offline OpenSSL verification")
+        return
+    canvas.pair("Reference CA bundle", verification["bundle"])
+    for status in ("verified", "failed", "unavailable"):
+        canvas.pair(status.title(), verification.get(status, 0))
+    for item in verification["results"][:args.max_display]:
+        canvas.pair(item["status"].upper(),
+                    shorten(item.get("subject"), 65) + " / " + shorten(item.get("detail"), 80))
+    canvas.wrap(verification["caveat"])
+
+
+def certificate_identity(record):
+    return {
+        "fingerprint": record.get("sha256"),
+        "subject": record.get("subject") or "",
+        "issuer": record.get("issuer") or "",
+        "serial": record.get("serial_number") or "",
+    }
+
+
+def build_issuer_graph(report):
+    records = unique_certificates(report)
+    by_subject = collections.defaultdict(list)
+    by_issuer = collections.defaultdict(list)
+    for record in records:
+        by_subject[record.get("subject") or ""].append(record)
+        by_issuer[record.get("issuer") or ""].append(record)
+    nodes = []
+    for record in records:
+        subject = record.get("subject") or ""
+        issuer = record.get("issuer") or ""
+        candidates = [item for item in by_subject.get(issuer, [])
+                      if item.get("sha256") != record.get("sha256")]
+        nodes.append({
+            "sha256": record.get("sha256"),
+            "subject": subject,
+            "issuer": issuer,
+            "self_issued": subject == issuer,
+            "issuer_name_candidates": [item.get("sha256") for item in candidates],
+            "candidate_count": len(candidates),
+            "issued_name_matches": len(by_issuer.get(subject, [])),
+            "issuer_name_missing": not candidates and subject != issuer,
+        })
+    return {
+        "nodes": nodes,
+        "issuer_name_missing": sum(item["issuer_name_missing"] for item in nodes),
+        "ambiguous_issuer_names": sum(item["candidate_count"] > 1 for item in nodes),
+        "self_issued": sum(item["self_issued"] for item in nodes),
+        "caveat": "Distinguished-name correlation only; no signature, path-length, AKI/SKI, or trust validation",
+    }
+
+
+def certificate_expiration_calendar(report):
+    entries = []
+    for record in unique_certificates(report):
+        timestamp = parse_iso(record.get("not_after"))
+        if timestamp is None:
+            continue
+        entries.append({
+            "sha256": record["sha256"],
+            "date": timestamp.date().isoformat(),
+            "timestamp": timestamp.isoformat(),
+            "subject": record.get("subject"),
+            "issuer": record.get("issuer"),
+            "source": record.get("path"),
+        })
+    entries.sort(key=lambda item: (item["timestamp"], item["sha256"]))
+    return entries
+
+
+def inspect_bundle_integrity(report):
+    sources = []
+    for file_record in report["files"]:
+        path = pathlib.Path(file_record["path"])
+        entry = {"path": str(path), "sha256": None, "bytes": None}
+        try:
+            if path.stat().st_size > 64 * 1024 * 1024:
+                entry["error"] = "file exceeds integrity inspection limit"
+            else:
+                digest = hashlib.sha256()
+                with path.open("rb") as stream:
+                    while True:
+                        chunk = stream.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                entry["sha256"] = digest.hexdigest()
+                entry["bytes"] = path.stat().st_size
+        except OSError as error:
+            entry["error"] = str(error)
+        sources.append(entry)
+    return sources
+
+
+def summarize_key_families(report):
+    families = collections.Counter()
+    sizes = collections.defaultdict(collections.Counter)
+    for record in unique_certificates(report):
+        detail = record.get("openssl") or {}
+        algorithm = (detail.get("public_key_algorithm") or "unknown").lower()
+        if "rsa" in algorithm:
+            family = "RSA"
+        elif "ec" in algorithm or "elliptic" in algorithm:
+            family = "EC"
+        elif "ed25519" in algorithm:
+            family = "Ed25519"
+        elif "ed448" in algorithm:
+            family = "Ed448"
+        elif "dsa" in algorithm:
+            family = "DSA"
+        else:
+            family = "Other/unknown"
+        families[family] += 1
+        sizes[family][str(detail.get("public_key_bits") or "unknown")] += 1
+    return {"families": dict(families),
+            "sizes": {key: dict(counter) for key, counter in sizes.items()}}
+
+
+def summarize_validity_windows(report):
+    periods = []
+    for record in unique_certificates(report):
+        start = parse_iso(record.get("not_before"))
+        end = parse_iso(record.get("not_after"))
+        if start is None or end is None:
+            continue
+        periods.append({"sha256": record["sha256"],
+                        "subject": record.get("subject"),
+                        "validity_days": round((end - start).total_seconds() / 86400, 2)})
+    periods.sort(key=lambda item: (item["validity_days"], item["sha256"]))
+    return {"shortest": periods[:20], "longest": list(reversed(periods[-20:])),
+            "total_with_validity": len(periods)}
+
+
+def render_issuer_graph(canvas, report, args):
+    canvas.section("20 / Issuer distinguished-name correlation")
+    graph = report.get("issuer_graph")
+    if not graph:
+        canvas.notice("info", "Issuer correlation unavailable")
+        return
+    canvas.pair("Self-issued names", graph["self_issued"])
+    canvas.pair("Issuer names without candidates", graph["issuer_name_missing"])
+    canvas.pair("Ambiguous issuer names", graph["ambiguous_issuer_names"])
+    selected = [node for node in graph["nodes"] if node["issuer_name_missing"]
+                or node["candidate_count"] > 1]
+    for node in selected[:args.top]:
+        canvas.pair(shorten(node["subject"], 38),
+                    f"issuer candidates={node['candidate_count']}; issuer={shorten(node['issuer'], 70)}")
+    canvas.wrap(graph["caveat"])
+
+
+def render_integrity(canvas, report, args):
+    canvas.section("21 / Source bundle integrity fingerprints")
+    entries = report.get("bundle_integrity") or []
+    if not entries:
+        canvas.notice("info", "No source bundle integrity information")
+        return
+    for entry in entries[:args.max_display]:
+        canvas.subsection(shorten(entry["path"], 90))
+        canvas.pair("SHA-256", entry.get("sha256") or "unavailable")
+        canvas.pair("Size", entry.get("bytes"))
+        if entry.get("error"):
+            canvas.pair("Error", entry["error"])
+
+
+def render_key_families(canvas, report, args):
+    canvas.section("22 / Cryptographic key-family breakdown")
+    families = report.get("key_families") or {}
+    canvas.table(["Key family", "Count"],
+                 sorted(families.get("families", {}).items(), key=lambda x: (-x[1], x[0])),
+                 widths=[30, 12])
+    for family, sizes in sorted(families.get("sizes", {}).items()):
+        canvas.subsection(family)
+        canvas.table(["Reported key bits", "Count"],
+                     sorted(sizes.items(), key=lambda x: (-x[1], x[0])), widths=[25, 12])
+
+
+def render_validity_windows(canvas, report, args):
+    canvas.section("23 / Certificate validity-period extremes")
+    windows = report.get("validity_windows") or {}
+    canvas.pair("Records with complete validity", windows.get("total_with_validity", 0))
+    for title, key in (("Shortest validity periods", "shortest"),
+                       ("Longest validity periods", "longest")):
+        canvas.subsection(title)
+        canvas.table(["Subject", "Days"],
+                     [(shorten(item["subject"], 70), item["validity_days"])
+                      for item in windows.get(key, [])[:args.top]], widths=[70, 15])
+
+
+def render_expiration_calendar(canvas, report, args):
+    canvas.section("24 / Chronological certificate expiration register")
+    calendar = report.get("expiration_calendar") or []
+    canvas.pair("Dated certificates", len(calendar))
+    canvas.table(["Expiration date", "Subject"],
+                 [(item["date"], shorten(item["subject"], 78))
+                  for item in calendar[:args.max_display]], widths=[18, 78])
+    if len(calendar) > args.max_display:
+        canvas.write(f"Additional records omitted: {len(calendar) - args.max_display}")
 
 
 def enhanced_main(argv=None):
@@ -1324,12 +1929,23 @@ def enhanced_main(argv=None):
             discovery_errors + scan_errors,
             args,
         )
+        enrich_report(report, args)
         export_enhanced(report, args)
+        if args.write_baseline:
+            write_atomic(args.write_baseline, json.dumps(report, indent=2, ensure_ascii=False) + "\n")
     except BrokenPipeError:
         return 0
     except (OSError, ValueError) as error:
         print(f"ca-trust-auditor: {error}", file=sys.stderr)
         return 2
+    if args.fail_on_change and report.get("comparison", {}).get("changed"):
+        return 3
+    if args.strict and report.get("audit", {}).get("critical_count", 0):
+        return 3
+    if args.strict_expiring and report["summary"]["expiring_soon"]:
+        return 3
+    if args.strict_crypto and report.get("audit", {}).get("crypto_count", 0):
+        return 3
     return 1 if report["errors"] else 0
 
 
